@@ -16,12 +16,12 @@
 
 grammar SqlBase;
 
-@members {
+@parser::members {
   /**
    * When false, INTERSECT is given the greater precedence over the other set
    * operations (UNION, EXCEPT and MINUS) as per the SQL standard.
    */
-  public boolean legacy_setops_precedence_enbled = false;
+  public boolean legacy_setops_precedence_enabled = false;
 
   /**
    * When false, a literal with an exponent would be converted into
@@ -29,6 +29,13 @@ grammar SqlBase;
    */
   public boolean legacy_exponent_literal_as_decimal_enabled = false;
 
+  /**
+   * When true, the behavior of keywords follows ANSI SQL standard.
+   */
+  public boolean SQL_standard_keyword_behavior = false;
+}
+
+@lexer::members {
   /**
    * Verify whether current token is a valid decimal token (which contains dot).
    * Returns true if the character that follows the token is not a digit or letter or underscore.
@@ -50,11 +57,6 @@ grammar SqlBase;
       return true;
     }
   }
-
-  /**
-   * When true, the behavior of keywords follows ANSI SQL standard.
-   */
-  public boolean SQL_standard_keyword_behavior = false;
 
   /**
    * This method will be called when we see '/*' and try to match it as a bracketed comment.
@@ -117,20 +119,9 @@ statement
         (RESTRICT | CASCADE)?                                          #dropNamespace
     | SHOW (DATABASES | NAMESPACES) ((FROM | IN) multipartIdentifier)?
         (LIKE? pattern=STRING)?                                        #showNamespaces
-    | createTableHeader ('(' colTypeList ')')? tableProvider
+    | createTableHeader ('(' colTypeList ')')? tableProvider?
         createTableClauses
         (AS? query)?                                                   #createTable
-    | createTableHeader ('(' columns=colTypeList ')')?
-        (commentSpec |
-        (PARTITIONED BY '(' partitionColumns=colTypeList ')' |
-        PARTITIONED BY partitionColumnNames=identifierList) |
-        bucketSpec |
-        skewSpec |
-        rowFormat |
-        createFileFormat |
-        locationSpec |
-        (TBLPROPERTIES tableProps=tablePropertyList))*
-        (AS? query)?                                                   #createHiveTable
     | CREATE TABLE (IF NOT EXISTS)? target=tableIdentifier
         LIKE source=tableIdentifier
         (tableProvider |
@@ -138,11 +129,13 @@ statement
         createFileFormat |
         locationSpec |
         (TBLPROPERTIES tableProps=tablePropertyList))*                 #createTableLike
-    | replaceTableHeader ('(' colTypeList ')')? tableProvider
+    | replaceTableHeader ('(' colTypeList ')')? tableProvider?
         createTableClauses
         (AS? query)?                                                   #replaceTable
     | ANALYZE TABLE multipartIdentifier partitionSpec? COMPUTE STATISTICS
         (identifier | FOR COLUMNS identifierSeq | FOR ALL COLUMNS)?    #analyze
+    | ANALYZE TABLES ((FROM | IN) multipartIdentifier)? COMPUTE STATISTICS
+        (identifier)?                                                  #analyzeTables
     | ALTER TABLE multipartIdentifier
         ADD (COLUMN | COLUMNS)
         columns=qualifiedColTypeWithPositionList                       #addTableColumns
@@ -207,7 +200,7 @@ statement
     | SHOW TABLES ((FROM | IN) multipartIdentifier)?
         (LIKE? pattern=STRING)?                                        #showTables
     | SHOW TABLE EXTENDED ((FROM | IN) ns=multipartIdentifier)?
-        LIKE pattern=STRING partitionSpec?                             #showTable
+        LIKE pattern=STRING partitionSpec?                             #showTableExtended
     | SHOW TBLPROPERTIES table=multipartIdentifier
         ('(' key=tablePropertyKey ')')?                                #showTblProperties
     | SHOW COLUMNS (FROM | IN) table=multipartIdentifier
@@ -229,6 +222,7 @@ statement
         comment=(STRING | NULL)                                        #commentNamespace
     | COMMENT ON TABLE multipartIdentifier IS comment=(STRING | NULL)  #commentTable
     | REFRESH TABLE multipartIdentifier                                #refreshTable
+    | REFRESH FUNCTION multipartIdentifier                             #refreshFunction
     | REFRESH (STRING | .*?)                                           #refreshResource
     | CACHE LAZY? TABLE multipartIdentifier
         (OPTIONS options=tablePropertyList)? (AS? query)?              #cacheTable
@@ -237,12 +231,28 @@ statement
     | LOAD DATA LOCAL? INPATH path=STRING OVERWRITE? INTO TABLE
         multipartIdentifier partitionSpec?                             #loadData
     | TRUNCATE TABLE multipartIdentifier partitionSpec?                #truncateTable
-    | MSCK REPAIR TABLE multipartIdentifier                            #repairTable
-    | op=(ADD | LIST) identifier (STRING | .*?)                        #manageResource
+    | MSCK REPAIR TABLE multipartIdentifier
+        (option=(ADD|DROP|SYNC) PARTITIONS)?                           #repairTable
+    | op=(ADD | LIST) identifier .*?                                   #manageResource
     | SET ROLE .*?                                                     #failNativeCommand
+    | SET TIME ZONE interval                                           #setTimeZone
+    | SET TIME ZONE timezone=(STRING | LOCAL)                          #setTimeZone
+    | SET TIME ZONE .*?                                                #setTimeZone
+    | SET configKey EQ configValue                                     #setQuotedConfiguration
+    | SET configKey (EQ .*?)?                                          #setQuotedConfiguration
+    | SET .*? EQ configValue                                           #setQuotedConfiguration
     | SET .*?                                                          #setConfiguration
-    | RESET                                                            #resetConfiguration
+    | RESET configKey                                                  #resetQuotedConfiguration
+    | RESET .*?                                                        #resetConfiguration
     | unsupportedHiveNativeCommands .*?                                #failNativeCommand
+    ;
+
+configKey
+    : quotedIdentifier
+    ;
+
+configValue
+    : quotedIdentifier
     ;
 
 unsupportedHiveNativeCommands
@@ -325,8 +335,8 @@ query
     ;
 
 insertInto
-    : INSERT OVERWRITE TABLE? multipartIdentifier (partitionSpec (IF NOT EXISTS)?)?                         #insertOverwriteTable
-    | INSERT INTO TABLE? multipartIdentifier partitionSpec? (IF NOT EXISTS)?                                #insertIntoTable
+    : INSERT OVERWRITE TABLE? multipartIdentifier (partitionSpec (IF NOT EXISTS)?)?  identifierList?        #insertOverwriteTable
+    | INSERT INTO TABLE? multipartIdentifier partitionSpec? (IF NOT EXISTS)? identifierList?                #insertIntoTable
     | INSERT OVERWRITE LOCAL? DIRECTORY path=STRING rowFormat? createFileFormat?                            #insertOverwriteHiveDir
     | INSERT OVERWRITE LOCAL? DIRECTORY (path=STRING)? tableProvider (OPTIONS options=tablePropertyList)?   #insertOverwriteDir
     ;
@@ -375,8 +385,11 @@ tableProvider
 
 createTableClauses
     :((OPTIONS options=tablePropertyList) |
-     (PARTITIONED BY partitioning=transformList) |
+     (PARTITIONED BY partitioning=partitionFieldList) |
+     skewSpec |
      bucketSpec |
+     rowFormat |
+     createFileFormat |
      locationSpec |
      commentSpec |
      (TBLPROPERTIES tableProps=tablePropertyList))*
@@ -456,11 +469,11 @@ multiInsertQueryBody
 
 queryTerm
     : queryPrimary                                                                       #queryTermDefault
-    | left=queryTerm {legacy_setops_precedence_enbled}?
+    | left=queryTerm {legacy_setops_precedence_enabled}?
         operator=(INTERSECT | UNION | EXCEPT | SETMINUS) setQuantifier? right=queryTerm  #setOperation
-    | left=queryTerm {!legacy_setops_precedence_enbled}?
+    | left=queryTerm {!legacy_setops_precedence_enabled}?
         operator=INTERSECT setQuantifier? right=queryTerm                                #setOperation
-    | left=queryTerm {!legacy_setops_precedence_enbled}?
+    | left=queryTerm {!legacy_setops_precedence_enabled}?
         operator=(UNION | EXCEPT | SETMINUS) setQuantifier? right=queryTerm              #setOperation
     ;
 
@@ -496,7 +509,11 @@ fromStatementBody
 querySpecification
     : transformClause
       fromClause?
-      whereClause?                                                          #transformQuerySpecification
+      lateralView*
+      whereClause?
+      aggregationClause?
+      havingClause?
+      windowClause?                                                         #transformQuerySpecification
     | selectClause
       fromClause?
       lateralView*
@@ -507,9 +524,9 @@ querySpecification
     ;
 
 transformClause
-    : (SELECT kind=TRANSFORM '(' namedExpressionSeq ')'
-            | kind=MAP namedExpressionSeq
-            | kind=REDUCE namedExpressionSeq)
+    : (SELECT kind=TRANSFORM '(' setQuantifier? expressionSeq ')'
+            | kind=MAP setQuantifier? expressionSeq
+            | kind=REDUCE setQuantifier? expressionSeq)
       inRowFormat=rowFormat?
       (RECORDWRITER recordWriter=STRING)?
       USING script=STRING
@@ -575,11 +592,27 @@ fromClause
     ;
 
 aggregationClause
-    : GROUP BY groupingExpressions+=expression (',' groupingExpressions+=expression)* (
+    : GROUP BY groupingExpressionsWithGroupingAnalytics+=groupByClause
+        (',' groupingExpressionsWithGroupingAnalytics+=groupByClause)*
+    | GROUP BY groupingExpressions+=expression (',' groupingExpressions+=expression)* (
       WITH kind=ROLLUP
     | WITH kind=CUBE
     | kind=GROUPING SETS '(' groupingSet (',' groupingSet)* ')')?
-    | GROUP BY kind=GROUPING SETS '(' groupingSet (',' groupingSet)* ')'
+    ;
+
+groupByClause
+    : groupingAnalytics
+    | expression
+    ;
+
+groupingAnalytics
+    : (ROLLUP | CUBE) '(' groupingSet (',' groupingSet)* ')'
+    | GROUPING SETS '(' groupingElement (',' groupingElement)* ')'
+    ;
+
+groupingElement
+    : groupingAnalytics
+    | groupingSet
     ;
 
 groupingSet
@@ -682,7 +715,7 @@ inlineTable
     ;
 
 functionTable
-    : funcName=errorCapturingIdentifier '(' (expression (',' expression)*)? ')' tableAlias
+    : funcName=functionName '(' (expression (',' expression)*)? ')' tableAlias
     ;
 
 tableAlias
@@ -723,8 +756,13 @@ namedExpressionSeq
     : namedExpression (',' namedExpression)*
     ;
 
-transformList
-    : '(' transforms+=transform (',' transforms+=transform)* ')'
+partitionFieldList
+    : '(' fields+=partitionField (',' fields+=partitionField)* ')'
+    ;
+
+partitionField
+    : transform  #partitionTransform
+    | colType    #partitionColumn
     ;
 
 transform
@@ -740,6 +778,10 @@ transformArgument
 
 expression
     : booleanExpression
+    ;
+
+expressionSeq
+    : expression (',' expression)*
     ;
 
 booleanExpression
@@ -777,7 +819,7 @@ primaryExpression
     : name=(CURRENT_DATE | CURRENT_TIMESTAMP)                                                  #currentDatetime
     | CASE whenClause+ (ELSE elseExpression=expression)? END                                   #searchedCase
     | CASE value=expression whenClause+ (ELSE elseExpression=expression)? END                  #simpleCase
-    | CAST '(' expression AS dataType ')'                                                      #cast
+    | name=(CAST | TRY_CAST) '(' expression AS dataType ')'                                    #cast
     | STRUCT '(' (argument+=namedExpression (',' argument+=namedExpression)*)? ')'             #struct
     | FIRST '(' expression (IGNORE NULLS)? ')'                                                 #first
     | LAST '(' expression (IGNORE NULLS)? ')'                                                  #last
@@ -788,7 +830,8 @@ primaryExpression
     | '(' namedExpression (',' namedExpression)+ ')'                                           #rowConstructor
     | '(' query ')'                                                                            #subqueryExpression
     | functionName '(' (setQuantifier? argument+=expression (',' argument+=expression)*)? ')'
-       (FILTER '(' WHERE where=booleanExpression ')')? (OVER windowSpec)?                      #functionCall
+       (FILTER '(' WHERE where=booleanExpression ')')?
+       (nullsOption=(IGNORE | RESPECT) NULLS)? ( OVER windowSpec)?                             #functionCall
     | identifier '->' expression                                                               #lambda
     | '(' identifier (',' identifier)+ ')' '->' expression                                     #lambda
     | value=primaryExpression '[' index=valueExpression ']'                                    #subscript
@@ -838,7 +881,7 @@ errorCapturingMultiUnitsInterval
     ;
 
 multiUnitsInterval
-    : (intervalValue intervalUnit)+
+    : (intervalValue unit+=identifier)+
     ;
 
 errorCapturingUnitToUnitInterval
@@ -846,22 +889,11 @@ errorCapturingUnitToUnitInterval
     ;
 
 unitToUnitInterval
-    : value=intervalValue from=intervalUnit TO to=intervalUnit
+    : value=intervalValue from=identifier TO to=identifier
     ;
 
 intervalValue
-    : (PLUS | MINUS)? (INTEGER_VALUE | DECIMAL_VALUE)
-    | STRING
-    ;
-
-intervalUnit
-    : DAY
-    | HOUR
-    | MINUTE
-    | MONTH
-    | SECOND
-    | YEAR
-    | identifier
+    : (PLUS | MINUS)? (INTEGER_VALUE | DECIMAL_VALUE | STRING)
     ;
 
 colPosition
@@ -872,6 +904,8 @@ dataType
     : complex=ARRAY '<' dataType '>'                            #complexDataType
     | complex=MAP '<' dataType ',' dataType '>'                 #complexDataType
     | complex=STRUCT ('<' complexColTypeList? '>' | NEQ)        #complexDataType
+    | INTERVAL YEAR TO MONTH                                    #yearMonthIntervalDataType
+    | INTERVAL DAY TO SECOND                                    #dayTimeIntervalDataType
     | identifier ('(' INTEGER_VALUE (',' INTEGER_VALUE)* ')')?  #primitiveDataType
     ;
 
@@ -988,6 +1022,7 @@ number
     | MINUS? SMALLINT_LITERAL         #smallIntLiteral
     | MINUS? TINYINT_LITERAL          #tinyIntLiteral
     | MINUS? DOUBLE_LITERAL           #doubleLiteral
+    | MINUS? FLOAT_LITERAL            #floatLiteral
     | MINUS? BIGDECIMAL_LITERAL       #bigDecimalLiteral
     ;
 
@@ -1044,6 +1079,7 @@ ansiNonReserved
     | DATA
     | DATABASE
     | DATABASES
+    | DAY
     | DBPROPERTIES
     | DEFINED
     | DELETE
@@ -1102,6 +1138,7 @@ ansiNonReserved
     | MAP
     | MATCHED
     | MERGE
+    | MONTH
     | MSCK
     | NAMESPACE
     | NAMESPACES
@@ -1137,6 +1174,7 @@ ansiNonReserved
     | REPAIR
     | REPLACE
     | RESET
+    | RESPECT
     | RESTRICT
     | REVOKE
     | RLIKE
@@ -1147,6 +1185,7 @@ ansiNonReserved
     | ROW
     | ROWS
     | SCHEMA
+    | SECOND
     | SEMI
     | SEPARATED
     | SERDE
@@ -1165,6 +1204,7 @@ ansiNonReserved
     | STRUCT
     | SUBSTR
     | SUBSTRING
+    | SYNC
     | TABLES
     | TABLESAMPLE
     | TBLPROPERTIES
@@ -1177,6 +1217,7 @@ ansiNonReserved
     | TRIM
     | TRUE
     | TRUNCATE
+    | TRY_CAST
     | TYPE
     | UNARCHIVE
     | UNBOUNDED
@@ -1189,6 +1230,8 @@ ansiNonReserved
     | VIEW
     | VIEWS
     | WINDOW
+    | YEAR
+    | ZONE
 //--ANSI-NON-RESERVED-END
     ;
 
@@ -1220,6 +1263,7 @@ strictNonReserved
     ;
 
 nonReserved
+//--DEFAULT-NON-RESERVED-START
     : ADD
     | AFTER
     | ALL
@@ -1314,7 +1358,6 @@ nonReserved
     | GROUP
     | GROUPING
     | HAVING
-    | HOUR
     | IF
     | IGNORE
     | IMPORT
@@ -1347,7 +1390,6 @@ nonReserved
     | MAP
     | MATCHED
     | MERGE
-    | MINUTE
     | MONTH
     | MSCK
     | NAMESPACE
@@ -1393,6 +1435,7 @@ nonReserved
     | REPAIR
     | REPLACE
     | RESET
+    | RESPECT
     | RESTRICT
     | REVOKE
     | RLIKE
@@ -1423,6 +1466,7 @@ nonReserved
     | STRUCT
     | SUBSTR
     | SUBSTRING
+    | SYNC
     | TABLE
     | TABLES
     | TABLESAMPLE
@@ -1430,6 +1474,7 @@ nonReserved
     | TEMPORARY
     | TERMINATED
     | THEN
+    | TIME
     | TO
     | TOUCH
     | TRAILING
@@ -1439,6 +1484,7 @@ nonReserved
     | TRIM
     | TRUE
     | TRUNCATE
+    | TRY_CAST
     | TYPE
     | UNARCHIVE
     | UNBOUNDED
@@ -1458,11 +1504,12 @@ nonReserved
     | WINDOW
     | WITH
     | YEAR
+    | ZONE
+//--DEFAULT-NON-RESERVED-END
     ;
 
 // NOTE: If you add a new token in the list below, you should update the list of keywords
-// in `docs/sql-keywords.md`. If the token is a non-reserved keyword,
-// please update `ansiNonReserved` and `nonReserved` as well.
+// and reserved tag in `docs/sql-ref-ansi-compliance.md#sql-keywords`.
 
 //============================
 // Start of the keywords list
@@ -1517,10 +1564,10 @@ CURRENT_DATE: 'CURRENT_DATE';
 CURRENT_TIME: 'CURRENT_TIME';
 CURRENT_TIMESTAMP: 'CURRENT_TIMESTAMP';
 CURRENT_USER: 'CURRENT_USER';
+DAY: 'DAY';
 DATA: 'DATA';
 DATABASE: 'DATABASE';
 DATABASES: 'DATABASES' | 'SCHEMAS';
-DAY: 'DAY';
 DBPROPERTIES: 'DBPROPERTIES';
 DEFINED: 'DEFINED';
 DELETE: 'DELETE';
@@ -1532,6 +1579,7 @@ DIRECTORIES: 'DIRECTORIES';
 DIRECTORY: 'DIRECTORY';
 DISTINCT: 'DISTINCT';
 DISTRIBUTE: 'DISTRIBUTE';
+DIV: 'DIV';
 DROP: 'DROP';
 ELSE: 'ELSE';
 END: 'END';
@@ -1565,7 +1613,6 @@ GRANT: 'GRANT';
 GROUP: 'GROUP';
 GROUPING: 'GROUPING';
 HAVING: 'HAVING';
-HOUR: 'HOUR';
 IF: 'IF';
 IGNORE: 'IGNORE';
 IMPORT: 'IMPORT';
@@ -1602,7 +1649,6 @@ MACRO: 'MACRO';
 MAP: 'MAP';
 MATCHED: 'MATCHED';
 MERGE: 'MERGE';
-MINUTE: 'MINUTE';
 MONTH: 'MONTH';
 MSCK: 'MSCK';
 NAMESPACE: 'NAMESPACE';
@@ -1650,6 +1696,7 @@ RENAME: 'RENAME';
 REPAIR: 'REPAIR';
 REPLACE: 'REPLACE';
 RESET: 'RESET';
+RESPECT: 'RESPECT';
 RESTRICT: 'RESTRICT';
 REVOKE: 'REVOKE';
 RIGHT: 'RIGHT';
@@ -1660,8 +1707,8 @@ ROLLBACK: 'ROLLBACK';
 ROLLUP: 'ROLLUP';
 ROW: 'ROW';
 ROWS: 'ROWS';
-SCHEMA: 'SCHEMA';
 SECOND: 'SECOND';
+SCHEMA: 'SCHEMA';
 SELECT: 'SELECT';
 SEMI: 'SEMI';
 SEPARATED: 'SEPARATED';
@@ -1683,6 +1730,7 @@ STRATIFY: 'STRATIFY';
 STRUCT: 'STRUCT';
 SUBSTR: 'SUBSTR';
 SUBSTRING: 'SUBSTRING';
+SYNC: 'SYNC';
 TABLE: 'TABLE';
 TABLES: 'TABLES';
 TABLESAMPLE: 'TABLESAMPLE';
@@ -1690,6 +1738,7 @@ TBLPROPERTIES: 'TBLPROPERTIES';
 TEMPORARY: 'TEMPORARY' | 'TEMP';
 TERMINATED: 'TERMINATED';
 THEN: 'THEN';
+TIME: 'TIME';
 TO: 'TO';
 TOUCH: 'TOUCH';
 TRAILING: 'TRAILING';
@@ -1699,6 +1748,7 @@ TRANSFORM: 'TRANSFORM';
 TRIM: 'TRIM';
 TRUE: 'TRUE';
 TRUNCATE: 'TRUNCATE';
+TRY_CAST: 'TRY_CAST';
 TYPE: 'TYPE';
 UNARCHIVE: 'UNARCHIVE';
 UNBOUNDED: 'UNBOUNDED';
@@ -1720,6 +1770,7 @@ WHERE: 'WHERE';
 WINDOW: 'WINDOW';
 WITH: 'WITH';
 YEAR: 'YEAR';
+ZONE: 'ZONE';
 //--SPARK-KEYWORD-LIST-END
 //============================
 // End of the keywords list
@@ -1739,7 +1790,6 @@ MINUS: '-';
 ASTERISK: '*';
 SLASH: '/';
 PERCENT: '%';
-DIV: 'DIV';
 TILDE: '~';
 AMPERSAND: '&';
 PIPE: '|';
@@ -1774,6 +1824,11 @@ EXPONENT_VALUE
 
 DECIMAL_VALUE
     : DECIMAL_DIGITS {isValidDecimal()}?
+    ;
+
+FLOAT_LITERAL
+    : DIGIT+ EXPONENT? 'F'
+    | DECIMAL_DIGITS EXPONENT? 'F' {isValidDecimal()}?
     ;
 
 DOUBLE_LITERAL

@@ -33,7 +33,7 @@ import org.apache.spark.scheduler.{AccumulableInfo, StageInfo, TaskInfo}
 import org.apache.spark.status.api.v1
 import org.apache.spark.storage.{RDDInfo, StorageLevel}
 import org.apache.spark.ui.SparkUI
-import org.apache.spark.util.AccumulatorContext
+import org.apache.spark.util.{AccumulatorContext, Utils}
 import org.apache.spark.util.collection.OpenHashSet
 
 /**
@@ -286,8 +286,8 @@ private[spark] class LiveExecutor(val executorId: String, _addTime: Long) extend
   var totalInputBytes = 0L
   var totalShuffleRead = 0L
   var totalShuffleWrite = 0L
-  var isBlacklisted = false
-  var blacklistedInStages: Set[Int] = TreeSet()
+  var isExcluded = false
+  var excludedInStages: Set[Int] = TreeSet()
 
   var executorLogs = Map[String, String]()
   var attributes = Map[String, String]()
@@ -307,7 +307,7 @@ private[spark] class LiveExecutor(val executorId: String, _addTime: Long) extend
   // peak values for executor level metrics
   val peakExecutorMetrics = new ExecutorMetrics()
 
-  def hostname: String = if (host != null) host else hostPort.split(":")(0)
+  def hostname: String = if (host != null) host else Utils.parseHostPort(hostPort)._1
 
   override protected def doUpdate(): Any = {
     val memoryMetrics = if (totalOnHeap >= 0) {
@@ -334,18 +334,20 @@ private[spark] class LiveExecutor(val executorId: String, _addTime: Long) extend
       totalInputBytes,
       totalShuffleRead,
       totalShuffleWrite,
-      isBlacklisted,
+      isExcluded,
       maxMemory,
       addTime,
       Option(removeTime),
       Option(removeReason),
       executorLogs,
       memoryMetrics,
-      blacklistedInStages,
+      excludedInStages,
       Some(peakExecutorMetrics).filter(_.isSet),
       attributes,
       resources,
-      resourceProfileId)
+      resourceProfileId,
+      isExcluded,
+      excludedInStages)
     new ExecutorSummaryWrapper(info)
   }
 }
@@ -361,9 +363,11 @@ private class LiveExecutorStageSummary(
   var succeededTasks = 0
   var failedTasks = 0
   var killedTasks = 0
-  var isBlacklisted = false
+  var isExcluded = false
 
   var metrics = createMetrics(default = 0L)
+
+  val peakExecutorMetrics = new ExecutorMetrics()
 
   override protected def doUpdate(): Any = {
     val info = new v1.ExecutorStageSummary(
@@ -381,20 +385,21 @@ private class LiveExecutorStageSummary(
       metrics.shuffleWriteMetrics.recordsWritten,
       metrics.memoryBytesSpilled,
       metrics.diskBytesSpilled,
-      isBlacklisted)
+      isExcluded,
+      Some(peakExecutorMetrics).filter(_.isSet),
+      isExcluded)
     new ExecutorStageSummaryWrapper(stageId, attemptId, executorId, info)
   }
 
 }
 
-private class LiveStage extends LiveEntity {
+private class LiveStage(var info: StageInfo) extends LiveEntity {
 
   import LiveEntityHelpers._
 
   var jobs = Seq[LiveJob]()
   var jobIds = Set[Int]()
 
-  var info: StageInfo = null
   var status = v1.StageStatus.PENDING
 
   var description: Option[String] = None
@@ -418,11 +423,13 @@ private class LiveStage extends LiveEntity {
 
   val activeTasksPerExecutor = new HashMap[String, Int]().withDefaultValue(0)
 
-  var blackListedExecutors = new HashSet[String]()
+  var excludedExecutors = new HashSet[String]()
+
+  val peakExecutorMetrics = new ExecutorMetrics()
 
   // Used for cleanup of tasks after they reach the configured limit. Not written to the store.
   @volatile var cleaning = false
-  var savedTasks = new AtomicInteger(0)
+  val savedTasks = new AtomicInteger(0)
 
   def executorSummary(executorId: String): LiveExecutorStageSummary = {
     executorSummaries.getOrElseUpdate(executorId,
@@ -484,7 +491,10 @@ private class LiveStage extends LiveEntity {
       tasks = None,
       executorSummary = None,
       killedTasksSummary = killedSummary,
-      resourceProfileId = info.resourceProfileId)
+      resourceProfileId = info.resourceProfileId,
+      peakExecutorMetrics = Some(peakExecutorMetrics).filter(_.isSet),
+      taskMetricsDistributions = None,
+      executorMetricsDistributions = None)
   }
 
   override protected def doUpdate(): Any = {
@@ -903,4 +913,28 @@ private class RDDPartitionSeq extends Seq[v1.RDDPartitionInfo] {
     }
   }
 
+}
+
+private[spark] class LiveMiscellaneousProcess(val processId: String,
+    creationTime: Long) extends LiveEntity {
+
+  var hostPort: String = null
+  var isActive = true
+  var totalCores = 0
+  val addTime = new Date(creationTime)
+  var removeTime: Date = null
+  var processLogs = Map[String, String]()
+
+  override protected def doUpdate(): Any = {
+
+    val info = new v1.ProcessSummary(
+      processId,
+      hostPort,
+      isActive,
+      totalCores,
+      addTime,
+      Option(removeTime),
+      processLogs)
+    new ProcessSummaryWrapper(info)
+  }
 }

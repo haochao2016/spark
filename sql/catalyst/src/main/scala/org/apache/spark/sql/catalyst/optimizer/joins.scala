@@ -25,6 +25,7 @@ import org.apache.spark.sql.catalyst.planning.ExtractFiltersAndInnerJoins
 import org.apache.spark.sql.catalyst.plans._
 import org.apache.spark.sql.catalyst.plans.logical._
 import org.apache.spark.sql.catalyst.rules._
+import org.apache.spark.sql.catalyst.trees.TreePattern.{INNER_LIKE_JOIN, OUTER_JOIN}
 import org.apache.spark.sql.internal.SQLConf
 
 /**
@@ -88,10 +89,11 @@ object ReorderJoin extends Rule[LogicalPlan] with PredicateHelper {
     }
   }
 
-  def apply(plan: LogicalPlan): LogicalPlan = plan transform {
+  def apply(plan: LogicalPlan): LogicalPlan = plan.transformWithPruning(
+    _.containsPattern(INNER_LIKE_JOIN), ruleId) {
     case p @ ExtractFiltersAndInnerJoins(input, conditions)
         if input.size > 2 && conditions.nonEmpty =>
-      val reordered = if (SQLConf.get.starSchemaDetection && !SQLConf.get.cboEnabled) {
+      val reordered = if (conf.starSchemaDetection && !conf.cboEnabled) {
         val starJoinPlan = StarSchemaDetection.reorderStarJoins(input, conditions)
         if (starJoinPlan.nonEmpty) {
           val rest = input.filterNot(starJoinPlan.contains(_))
@@ -158,7 +160,8 @@ object EliminateOuterJoin extends Rule[LogicalPlan] with PredicateHelper {
     }
   }
 
-  def apply(plan: LogicalPlan): LogicalPlan = plan transform {
+  def apply(plan: LogicalPlan): LogicalPlan = plan.transformWithPruning(
+    _.containsPattern(OUTER_JOIN), ruleId) {
     case f @ Filter(condition, j @ Join(_, _, RightOuter | LeftOuter | FullOuter, _, _)) =>
       val newJoinType = buildNewJoinType(f, j)
       if (j.joinType == newJoinType) f else Filter(condition, j.copy(joinType = newJoinType))
@@ -235,8 +238,8 @@ trait JoinSelectionHelper {
       canBroadcastBySize(right, conf) && !hintToNotBroadcastRight(hint)
     }
     getBuildSide(
-      canBuildLeft(joinType) && buildLeft,
-      canBuildRight(joinType) && buildRight,
+      canBuildBroadcastLeft(joinType) && buildLeft,
+      canBuildBroadcastRight(joinType) && buildRight,
       left,
       right
     )
@@ -260,8 +263,8 @@ trait JoinSelectionHelper {
       canBuildLocalHashMapBySize(right, conf) && muchSmaller(right, left)
     }
     getBuildSide(
-      canBuildLeft(joinType) && buildLeft,
-      canBuildRight(joinType) && buildRight,
+      canBuildShuffledHashJoinLeft(joinType) && buildLeft,
+      canBuildShuffledHashJoinRight(joinType) && buildRight,
       left,
       right
     )
@@ -275,21 +278,49 @@ trait JoinSelectionHelper {
    * Matches a plan whose output should be small enough to be used in broadcast join.
    */
   def canBroadcastBySize(plan: LogicalPlan, conf: SQLConf): Boolean = {
-    plan.stats.sizeInBytes >= 0 && plan.stats.sizeInBytes <= conf.autoBroadcastJoinThreshold
+    val autoBroadcastJoinThreshold = if (plan.stats.isRuntime) {
+      conf.getConf(SQLConf.ADAPTIVE_AUTO_BROADCASTJOIN_THRESHOLD)
+        .getOrElse(conf.autoBroadcastJoinThreshold)
+    } else {
+      conf.autoBroadcastJoinThreshold
+    }
+    plan.stats.sizeInBytes >= 0 && plan.stats.sizeInBytes <= autoBroadcastJoinThreshold
   }
 
-  def canBuildLeft(joinType: JoinType): Boolean = {
+  def canBuildBroadcastLeft(joinType: JoinType): Boolean = {
     joinType match {
       case _: InnerLike | RightOuter => true
       case _ => false
     }
   }
 
-  def canBuildRight(joinType: JoinType): Boolean = {
+  def canBuildBroadcastRight(joinType: JoinType): Boolean = {
     joinType match {
       case _: InnerLike | LeftOuter | LeftSemi | LeftAnti | _: ExistenceJoin => true
       case _ => false
     }
+  }
+
+  def canBuildShuffledHashJoinLeft(joinType: JoinType): Boolean = {
+    joinType match {
+      case _: InnerLike | RightOuter | FullOuter => true
+      case _ => false
+    }
+  }
+
+  def canBuildShuffledHashJoinRight(joinType: JoinType): Boolean = {
+    joinType match {
+      case _: InnerLike | LeftOuter | FullOuter |
+           LeftSemi | LeftAnti | _: ExistenceJoin => true
+      case _ => false
+    }
+  }
+
+  def canPlanAsBroadcastHashJoin(join: Join, conf: SQLConf): Boolean = {
+    getBroadcastBuildSide(join.left, join.right, join.joinType,
+      join.hint, hintOnly = true, conf).isDefined ||
+      getBroadcastBuildSide(join.left, join.right, join.joinType,
+        join.hint, hintOnly = false, conf).isDefined
   }
 
   def hintToBroadcastLeft(hint: JoinHint): Boolean = {

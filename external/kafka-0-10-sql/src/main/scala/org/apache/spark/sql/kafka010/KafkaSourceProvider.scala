@@ -30,13 +30,14 @@ import org.apache.spark.internal.Logging
 import org.apache.spark.kafka010.KafkaConfigUpdater
 import org.apache.spark.sql.{AnalysisException, DataFrame, SaveMode, SQLContext}
 import org.apache.spark.sql.catalyst.util.CaseInsensitiveMap
-import org.apache.spark.sql.connector.catalog.{SupportsRead, SupportsWrite, Table, TableCapability, TableProvider}
+import org.apache.spark.sql.connector.catalog.{SupportsRead, SupportsWrite, Table, TableCapability}
+import org.apache.spark.sql.connector.metric.{CustomMetric, CustomSumMetric}
 import org.apache.spark.sql.connector.read.{Batch, Scan, ScanBuilder}
 import org.apache.spark.sql.connector.read.streaming.{ContinuousStream, MicroBatchStream}
 import org.apache.spark.sql.connector.write.{BatchWrite, LogicalWriteInfo, SupportsTruncate, WriteBuilder}
 import org.apache.spark.sql.connector.write.streaming.StreamingWrite
 import org.apache.spark.sql.execution.streaming.{Sink, Source}
-import org.apache.spark.sql.internal.connector.{SimpleTableProvider, SupportsStreamingUpdate}
+import org.apache.spark.sql.internal.connector.{SimpleTableProvider, SupportsStreamingUpdateAsAppend}
 import org.apache.spark.sql.sources._
 import org.apache.spark.sql.streaming.OutputMode
 import org.apache.spark.sql.types.StructType
@@ -93,7 +94,7 @@ private[kafka010] class KafkaSourceProvider extends DataSourceRegister
       caseInsensitiveParameters, STARTING_OFFSETS_BY_TIMESTAMP_OPTION_KEY,
       STARTING_OFFSETS_OPTION_KEY, LatestOffsetRangeLimit)
 
-    val kafkaOffsetReader = new KafkaOffsetReader(
+    val kafkaOffsetReader = KafkaOffsetReader.build(
       strategy(caseInsensitiveParameters),
       kafkaParamsForDriver(specifiedKafkaParams),
       caseInsensitiveParameters,
@@ -394,7 +395,7 @@ private[kafka010] class KafkaSourceProvider extends DataSourceRegister
       () => new KafkaScan(options)
 
     override def newWriteBuilder(info: LogicalWriteInfo): WriteBuilder = {
-      new WriteBuilder with SupportsTruncate with SupportsStreamingUpdate {
+      new WriteBuilder with SupportsTruncate with SupportsStreamingUpdateAsAppend {
         private val options = info.options
         private val inputSchema: StructType = info.schema()
         private val topic = Option(options.get(TOPIC_OPTION_KEY)).map(_.trim)
@@ -412,7 +413,6 @@ private[kafka010] class KafkaSourceProvider extends DataSourceRegister
         }
 
         override def truncate(): WriteBuilder = this
-        override def update(): WriteBuilder = this
       }
     }
   }
@@ -461,7 +461,7 @@ private[kafka010] class KafkaSourceProvider extends DataSourceRegister
         caseInsensitiveOptions, STARTING_OFFSETS_BY_TIMESTAMP_OPTION_KEY,
         STARTING_OFFSETS_OPTION_KEY, LatestOffsetRangeLimit)
 
-      val kafkaOffsetReader = new KafkaOffsetReader(
+      val kafkaOffsetReader = KafkaOffsetReader.build(
         strategy(caseInsensitiveOptions),
         kafkaParamsForDriver(specifiedKafkaParams),
         caseInsensitiveOptions,
@@ -490,7 +490,7 @@ private[kafka010] class KafkaSourceProvider extends DataSourceRegister
         caseInsensitiveOptions, STARTING_OFFSETS_BY_TIMESTAMP_OPTION_KEY,
         STARTING_OFFSETS_OPTION_KEY, LatestOffsetRangeLimit)
 
-      val kafkaOffsetReader = new KafkaOffsetReader(
+      val kafkaOffsetReader = KafkaOffsetReader.build(
         strategy(caseInsensitiveOptions),
         kafkaParamsForDriver(specifiedKafkaParams),
         caseInsensitiveOptions,
@@ -504,7 +504,21 @@ private[kafka010] class KafkaSourceProvider extends DataSourceRegister
         startingStreamOffsets,
         failOnDataLoss(caseInsensitiveOptions))
     }
+
+    override def supportedCustomMetrics(): Array[CustomMetric] = {
+      Array(new OffsetOutOfRangeMetric, new DataLossMetric)
+    }
   }
+}
+
+private[spark] class OffsetOutOfRangeMetric extends CustomSumMetric {
+  override def name(): String = "offsetOutOfRange"
+  override def description(): String = "estimated number of fetched offsets out of range"
+}
+
+private[spark] class DataLossMetric extends CustomSumMetric {
+  override def name(): String = "dataLoss"
+  override def description(): String = "number of data loss error"
 }
 
 private[kafka010] object KafkaSourceProvider extends Logging {

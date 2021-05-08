@@ -18,7 +18,7 @@
 package org.apache.spark.sql.catalyst.expressions
 
 import java.sql.{Date, Timestamp}
-import java.time.{Duration, Instant, LocalDate}
+import java.time.{Duration, Instant, LocalDate, Period}
 import java.util.concurrent.TimeUnit
 
 import org.scalacheck.{Arbitrary, Gen}
@@ -68,16 +68,27 @@ object LiteralGenerator {
   lazy val longLiteralGen: Gen[Literal] =
     for { l <- Arbitrary.arbLong.arbitrary } yield Literal.create(l, LongType)
 
+  // The floatLiteralGen and doubleLiteralGen will 50% of the time yield arbitrary values
+  // and 50% of the time will yield some special values that are more likely to reveal
+  // corner cases. This behavior is similar to the integral value generators.
   lazy val floatLiteralGen: Gen[Literal] =
     for {
-      f <- Gen.chooseNum(Float.MinValue / 2, Float.MaxValue / 2,
-        Float.NaN, Float.PositiveInfinity, Float.NegativeInfinity)
+      f <- Gen.oneOf(
+        Gen.oneOf(
+          Float.NaN, Float.PositiveInfinity, Float.NegativeInfinity, Float.MinPositiveValue,
+          Float.MaxValue, -Float.MaxValue, 0.0f, -0.0f, 1.0f, -1.0f),
+        Arbitrary.arbFloat.arbitrary
+      )
     } yield Literal.create(f, FloatType)
 
   lazy val doubleLiteralGen: Gen[Literal] =
     for {
-      f <- Gen.chooseNum(Double.MinValue / 2, Double.MaxValue / 2,
-        Double.NaN, Double.PositiveInfinity, Double.NegativeInfinity)
+      f <- Gen.oneOf(
+        Gen.oneOf(
+          Double.NaN, Double.PositiveInfinity, Double.NegativeInfinity, Double.MinPositiveValue,
+          Double.MaxValue, -Double.MaxValue, 0.0, -0.0, 1.0, -1.0),
+        Arbitrary.arbDouble.arbitrary
+      )
     } yield Literal.create(f, DoubleType)
 
   // TODO cache the generated data
@@ -152,6 +163,19 @@ object LiteralGenerator {
   lazy val limitedIntegerLiteralGen: Gen[Literal] =
     for { i <- Gen.choose(-100, 100) } yield Literal.create(i, IntegerType)
 
+  lazy val dayTimeIntervalLiteralGen: Gen[Literal] = {
+    calendarIntervalLiterGen.map { calendarIntervalLiteral =>
+      Literal.create(
+        calendarIntervalLiteral.value.asInstanceOf[CalendarInterval].extractAsDuration(),
+        DayTimeIntervalType)
+    }
+  }
+
+  lazy val yearMonthIntervalLiteralGen: Gen[Literal] = {
+    for { months <- Gen.choose(-1 * maxIntervalInMonths, maxIntervalInMonths) }
+      yield Literal.create(Period.ofMonths(months), YearMonthIntervalType)
+  }
+
   def randomGen(dt: DataType): Gen[Literal] = {
     dt match {
       case ByteType => byteLiteralGen
@@ -167,6 +191,8 @@ object LiteralGenerator {
       case BinaryType => binaryLiteralGen
       case CalendarIntervalType => calendarIntervalLiterGen
       case DecimalType.Fixed(precision, scale) => decimalLiteralGen(precision, scale)
+      case DayTimeIntervalType => dayTimeIntervalLiteralGen
+      case YearMonthIntervalType => yearMonthIntervalLiteralGen
       case dt => throw new IllegalArgumentException(s"not supported type $dt")
     }
   }

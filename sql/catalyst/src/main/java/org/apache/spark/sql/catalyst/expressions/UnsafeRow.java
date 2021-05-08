@@ -90,7 +90,9 @@ public final class UnsafeRow extends InternalRow implements Externalizable, Kryo
           FloatType,
           DoubleType,
           DateType,
-          TimestampType
+          TimestampType,
+          YearMonthIntervalType,
+          DayTimeIntervalType
         })));
   }
 
@@ -288,7 +290,7 @@ public final class UnsafeRow extends InternalRow implements Externalizable, Kryo
       Platform.putLong(baseObject, baseOffset + cursor, 0L);
       Platform.putLong(baseObject, baseOffset + cursor + 8, 0L);
 
-      if (value == null) {
+      if (value == null || !value.changePrecision(precision, value.scale())) {
         setNullAt(ordinal);
         // keep the offset for future update
         Platform.putLong(baseObject, getFieldOffset(ordinal), cursor << 32);

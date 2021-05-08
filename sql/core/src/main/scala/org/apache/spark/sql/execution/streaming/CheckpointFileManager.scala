@@ -83,6 +83,12 @@ trait CheckpointFileManager {
 
   /** Is the default file system this implementation is operating on the local file system. */
   def isLocal: Boolean
+
+  /**
+   * Creates the checkpoint path if it does not exist, and returns the qualified
+   * checkpoint path.
+   */
+  def createCheckpointDirectory(): Path
 }
 
 object CheckpointFileManager extends Logging {
@@ -160,11 +166,17 @@ object CheckpointFileManager extends Logging {
     override def cancel(): Unit = synchronized {
       try {
         if (terminated) return
-        underlyingStream.close()
+        try {
+          underlyingStream.close()
+        } catch {
+          case NonFatal(e) =>
+            logWarning(s"Error cancelling write to $finalPath, " +
+              s"continuing to delete temp path $tempPath", e)
+        }
         fm.delete(tempPath)
       } catch {
         case NonFatal(e) =>
-          logWarning(s"Error cancelling write to $finalPath", e)
+          logWarning(s"Error deleting temp file $tempPath", e)
       } finally {
         terminated = true
       }
@@ -271,7 +283,6 @@ class FileSystemBasedCheckpointFileManager(path: Path, hadoopConf: Configuration
       fs.delete(path, true)
     } catch {
       case e: FileNotFoundException =>
-        logInfo(s"Failed to delete $path as it does not exist")
         // ignore if file has already been deleted
     }
   }
@@ -279,6 +290,12 @@ class FileSystemBasedCheckpointFileManager(path: Path, hadoopConf: Configuration
   override def isLocal: Boolean = fs match {
     case _: LocalFileSystem | _: RawLocalFileSystem => true
     case _ => false
+  }
+
+  override def createCheckpointDirectory(): Path = {
+    val qualifiedPath = fs.makeQualified(path)
+    fs.mkdirs(qualifiedPath, FsPermission.getDirDefault)
+    qualifiedPath
   }
 }
 
@@ -344,6 +361,12 @@ class FileContextBasedCheckpointFileManager(path: Path, hadoopConf: Configuratio
   override def isLocal: Boolean = fc.getDefaultFileSystem match {
     case _: LocalFs | _: RawLocalFs => true // LocalFs = RawLocalFs + ChecksumFs
     case _ => false
+  }
+
+  override def createCheckpointDirectory(): Path = {
+    val qualifiedPath = fc.makeQualified(path)
+    fc.mkdir(qualifiedPath, FsPermission.getDirDefault, true)
+    qualifiedPath
   }
 
   private def mayRemoveCrcFile(path: Path): Unit = {

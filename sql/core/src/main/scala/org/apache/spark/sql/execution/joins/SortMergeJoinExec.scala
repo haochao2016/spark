@@ -26,7 +26,6 @@ import org.apache.spark.sql.catalyst.expressions.BindReferences.bindReferences
 import org.apache.spark.sql.catalyst.expressions.codegen._
 import org.apache.spark.sql.catalyst.expressions.codegen.Block._
 import org.apache.spark.sql.catalyst.plans._
-import org.apache.spark.sql.catalyst.plans.physical._
 import org.apache.spark.sql.execution._
 import org.apache.spark.sql.execution.metric.{SQLMetric, SQLMetrics}
 import org.apache.spark.util.collection.BitSet
@@ -41,59 +40,10 @@ case class SortMergeJoinExec(
     condition: Option[Expression],
     left: SparkPlan,
     right: SparkPlan,
-    isSkewJoin: Boolean = false) extends BaseJoinExec with CodegenSupport {
+    isSkewJoin: Boolean = false) extends ShuffledJoin with CodegenSupport {
 
   override lazy val metrics = Map(
     "numOutputRows" -> SQLMetrics.createMetric(sparkContext, "number of output rows"))
-
-  override def nodeName: String = {
-    if (isSkewJoin) super.nodeName + "(skew=true)" else super.nodeName
-  }
-
-  override def stringArgs: Iterator[Any] = super.stringArgs.toSeq.dropRight(1).iterator
-
-  override def output: Seq[Attribute] = {
-    joinType match {
-      case _: InnerLike =>
-        left.output ++ right.output
-      case LeftOuter =>
-        left.output ++ right.output.map(_.withNullability(true))
-      case RightOuter =>
-        left.output.map(_.withNullability(true)) ++ right.output
-      case FullOuter =>
-        (left.output ++ right.output).map(_.withNullability(true))
-      case j: ExistenceJoin =>
-        left.output :+ j.exists
-      case LeftExistence(_) =>
-        left.output
-      case x =>
-        throw new IllegalArgumentException(
-          s"${getClass.getSimpleName} should not take $x as the JoinType")
-    }
-  }
-
-  override def outputPartitioning: Partitioning = joinType match {
-    case _: InnerLike =>
-      PartitioningCollection(Seq(left.outputPartitioning, right.outputPartitioning))
-    // For left and right outer joins, the output is partitioned by the streamed input's join keys.
-    case LeftOuter => left.outputPartitioning
-    case RightOuter => right.outputPartitioning
-    case FullOuter => UnknownPartitioning(left.outputPartitioning.numPartitions)
-    case LeftExistence(_) => left.outputPartitioning
-    case x =>
-      throw new IllegalArgumentException(
-        s"${getClass.getSimpleName} should not take $x as the JoinType")
-  }
-
-  override def requiredChildDistribution: Seq[Distribution] = {
-    if (isSkewJoin) {
-      // We re-arrange the shuffle partitions to deal with skew join, and the new children
-      // partitioning doesn't satisfy `HashClusteredDistribution`.
-      UnspecifiedDistribution :: UnspecifiedDistribution :: Nil
-    } else {
-      HashClusteredDistribution(leftKeys) :: HashClusteredDistribution(rightKeys) :: Nil
-    }
-  }
 
   override def outputOrdering: Seq[SortOrder] = joinType match {
     // For inner join, orders of both sides keys should be kept.
@@ -101,9 +51,9 @@ case class SortMergeJoinExec(
       val leftKeyOrdering = getKeyOrdering(leftKeys, left.outputOrdering)
       val rightKeyOrdering = getKeyOrdering(rightKeys, right.outputOrdering)
       leftKeyOrdering.zip(rightKeyOrdering).map { case (lKey, rKey) =>
-        // Also add the right key and its `sameOrderExpressions`
-        SortOrder(lKey.child, Ascending, lKey.sameOrderExpressions + rKey.child ++ rKey
-          .sameOrderExpressions)
+        // Also add expressions from right side sort order
+        val sameOrderExpressions = ExpressionSet(lKey.sameOrderExpressions ++ rKey.children)
+        SortOrder(lKey.child, Ascending, sameOrderExpressions.toSeq)
       }
     // For left and right outer joins, the output is ordered by the streamed input's join keys.
     case LeftOuter => getKeyOrdering(leftKeys, left.outputOrdering)
@@ -129,7 +79,8 @@ case class SortMergeJoinExec(
     val requiredOrdering = requiredOrders(keys)
     if (SortOrder.orderingSatisfies(childOutputOrdering, requiredOrdering)) {
       keys.zip(childOutputOrdering).map { case (key, childOrder) =>
-        SortOrder(key, Ascending, childOrder.sameOrderExpressions + childOrder.child - key)
+        val sameOrderExpressionsSet = ExpressionSet(childOrder.children) - key
+        SortOrder(key, Ascending, sameOrderExpressionsSet.toSeq)
       }
     } else {
       requiredOrdering
@@ -284,7 +235,8 @@ case class SortMergeJoinExec(
               RowIterator.fromScala(rightIter),
               inMemoryThreshold,
               spillThreshold,
-              cleanupResources
+              cleanupResources,
+              condition.isEmpty
             )
             private[this] val joinRow = new JoinedRow
 
@@ -320,7 +272,8 @@ case class SortMergeJoinExec(
               RowIterator.fromScala(rightIter),
               inMemoryThreshold,
               spillThreshold,
-              cleanupResources
+              cleanupResources,
+              condition.isEmpty
             )
             private[this] val joinRow = new JoinedRow
 
@@ -363,7 +316,8 @@ case class SortMergeJoinExec(
               RowIterator.fromScala(rightIter),
               inMemoryThreshold,
               spillThreshold,
-              cleanupResources
+              cleanupResources,
+              condition.isEmpty
             )
             private[this] val joinRow = new JoinedRow
 
@@ -662,6 +616,10 @@ case class SortMergeJoinExec(
        |$eagerCleanup
      """.stripMargin
   }
+
+  override protected def withNewChildrenInternal(
+      newLeft: SparkPlan, newRight: SparkPlan): SortMergeJoinExec =
+    copy(left = newLeft, right = newRight)
 }
 
 /**
@@ -686,6 +644,7 @@ case class SortMergeJoinExec(
  *                          internal buffer
  * @param spillThreshold Threshold for number of rows to be spilled by internal buffer
  * @param eagerCleanupResources the eager cleanup function to be invoked when no join row found
+ * @param onlyBufferFirstMatch [[bufferMatchingRows]] should buffer only the first matching row
  */
 private[joins] class SortMergeJoinScanner(
     streamedKeyGenerator: Projection,
@@ -695,7 +654,8 @@ private[joins] class SortMergeJoinScanner(
     bufferedIter: RowIterator,
     inMemoryThreshold: Int,
     spillThreshold: Int,
-    eagerCleanupResources: () => Unit) {
+    eagerCleanupResources: () => Unit,
+    onlyBufferFirstMatch: Boolean = false) {
   private[this] var streamedRow: InternalRow = _
   private[this] var streamedRowKey: InternalRow = _
   private[this] var bufferedRow: InternalRow = _
@@ -706,8 +666,9 @@ private[joins] class SortMergeJoinScanner(
    */
   private[this] var matchJoinKey: InternalRow = _
   /** Buffered rows from the buffered side of the join. This is empty if there are no matches. */
-  private[this] val bufferedMatches =
-    new ExternalAppendOnlyUnsafeRowArray(inMemoryThreshold, spillThreshold)
+  private[this] val bufferedMatches: ExternalAppendOnlyUnsafeRowArray =
+    new ExternalAppendOnlyUnsafeRowArray(if (onlyBufferFirstMatch) 1 else inMemoryThreshold,
+      spillThreshold)
 
   // Initialization (note: do _not_ want to advance streamed here).
   advancedBufferedToRowWithNullFreeJoinKey()
@@ -867,7 +828,9 @@ private[joins] class SortMergeJoinScanner(
     matchJoinKey = streamedRowKey.copy()
     bufferedMatches.clear()
     do {
-      bufferedMatches.add(bufferedRow.asInstanceOf[UnsafeRow])
+      if (!onlyBufferFirstMatch || bufferedMatches.isEmpty) {
+        bufferedMatches.add(bufferedRow.asInstanceOf[UnsafeRow])
+      }
       advancedBufferedToRowWithNullFreeJoinKey()
     } while (bufferedRow != null && keyOrdering.compare(streamedRowKey, bufferedRowKey) == 0)
   }
